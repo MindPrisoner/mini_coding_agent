@@ -40,11 +40,23 @@ def guess_related_keywords(error_text: str, debug_result: dict) -> list[str]:
     if "ModuleNotFoundError" in error_text:
         keywords.append("import")
 
+    if "Checkpointer requires" in error_text:
+        keywords.extend(["graph.invoke", "thread_id", "configurable", "config"])
+
     final_answer = debug_result.get("final_answer", {})
     root_cause = final_answer.get("root_cause", "")
     fix_suggestion = " ".join(final_answer.get("fix_suggestion", []))
 
-    for token in ["utils", "agent_stage", "mypkg", "main.py"]:
+    for token in [
+        "utils",
+        "agent_stage",
+        "mypkg",
+        "main.py",
+        "agent_cli.py",
+        "graph.invoke",
+        "thread_id",
+        "config",
+    ]:
         if token in error_text or token in root_cause or token in fix_suggestion:
             keywords.append(token)
 
@@ -68,7 +80,12 @@ def collect_related_files(project_dir: str, error_text: str, debug_result: dict,
             if file_path not in selected_files:
                 selected_files.append(file_path)
 
-    for fallback in ["main.py", "README.md"]:
+    for fallback in [
+        "agent_stage/agent_cli.py",
+        "main.py",
+        "cli.py",
+        "README.md",
+    ]:
         if fallback in all_files and fallback not in selected_files:
             selected_files.append(fallback)
 
@@ -76,7 +93,7 @@ def collect_related_files(project_dir: str, error_text: str, debug_result: dict,
 
     related = []
     for file_path in selected_files:
-        content_result = read_file(project_dir=project_dir, file_path=file_path, max_chars=4000)
+        content_result = read_file(project_dir=project_dir, file_path=file_path, max_chars=6000)
         related.append(content_result)
 
     return related
@@ -140,25 +157,112 @@ def normalize_verify_command(command: str) -> str:
     if command.startswith("cd "):
         return ""
 
+    if command.startswith("python -m agent_cli"):
+        command = command.replace("python -m agent_cli", "python -m agent_stage.agent_cli", 1)
+
+    if command.startswith("python agent_stage/agent_cli.py"):
+        command = command.replace("python agent_stage/agent_cli.py", "python -m agent_stage.agent_cli", 1)
+
     return command
 
 
+def build_unified_diff(target_file: str, original_text: str, modified_text: str) -> str:
+    original_lines = original_text.splitlines()
+    modified_lines = modified_text.splitlines()
+
+    diff_lines = difflib.unified_diff(
+        [line + "\n" for line in original_lines],
+        [line + "\n" for line in modified_lines],
+        fromfile=f"a/{target_file}",
+        tofile=f"b/{target_file}",
+        n=3,
+    )
+
+    patch = "".join(diff_lines)
+
+    if not patch.endswith("\n"):
+        patch += "\n"
+
+    return patch
+
+
+def rebuild_langgraph_config_patch(project_dir: str, target_files: list[str], error_text: str, patch_result: dict) -> str | None:
+    """
+    专门处理 LangGraph checkpointer 报错：
+
+    问题模式：
+    - agent_cli.py 里已经定义了 config
+    - graph.invoke(...) 调用时没有传 config=config
+
+    修复方式：
+    - 给 graph.invoke(...) 添加第二个参数 config=config
+    """
+    reason = patch_result.get("reason", "")
+    patch_text = patch_result.get("patch", "")
+
+    is_langgraph_error = (
+        "Checkpointer requires" in error_text
+        or "configurable" in error_text
+        or "thread_id" in error_text
+        or "graph.invoke" in reason
+        or "config=config" in patch_text
+    )
+
+    if not is_langgraph_error:
+        return None
+
+    candidate_files = target_files or ["agent_stage/agent_cli.py"]
+
+    if "agent_stage/agent_cli.py" not in candidate_files:
+        return None
+
+    project_root = Path(project_dir).resolve()
+    target_file = "agent_stage/agent_cli.py"
+    file_path = project_root / target_file
+
+    if not file_path.exists():
+        return None
+
+    original_text = file_path.read_text(encoding="utf-8", errors="ignore")
+
+    if "config=config" in original_text:
+        return None
+
+    old_block = """    result = graph.invoke(
+        {
+            "user_query": args.query,
+            "knowledge_dir": args.dir,
+        }
+    )
+"""
+
+    new_block = """    result = graph.invoke(
+        {
+            "user_query": args.query,
+            "knowledge_dir": args.dir,
+        },
+        config=config,
+    )
+"""
+
+    if old_block not in original_text:
+        return None
+
+    modified_text = original_text.replace(old_block, new_block, 1)
+
+    return build_unified_diff(
+        target_file=target_file,
+        original_text=original_text,
+        modified_text=modified_text,
+    )
+
+
 def extract_simple_replacements_from_patch(patch: str) -> list[tuple[str, str]]:
-    """
-    从 LLM 生成的 patch 中提取简单的单行替换。
-
-    例如：
-    -from utils import hello
-    +from mypkg.utils import hello
-
-    会提取为：
-    ("from utils import hello", "from mypkg.utils import hello")
-    """
     removed_lines = []
     added_lines = []
 
     for line in patch.splitlines():
-        if line.startswith("---") or line.startswith("+++"):
+        if line.startswith("---") or line.startswith("+++") or line.startswith("@@"):
             continue
 
         if line.startswith("-"):
@@ -177,33 +281,19 @@ def extract_simple_replacements_from_patch(patch: str) -> list[tuple[str, str]]:
     return pairs
 
 
-def rebuild_patch_with_context(project_dir: str, target_files: list[str], patch_text: str) -> str:
-    """
-    根据 LLM patch 中的修改意图，重新生成带上下文的标准 unified diff。
-
-    这一步是为了避免 LLM 生成的 patch 虽然语义正确，
-    但 git apply 无法稳定应用。
-    """
-    if not target_files:
-        return patch_text
-
-    if len(target_files) != 1:
-        return patch_text
-
-    target_file = target_files[0]
+def rebuild_patch_by_simple_replacements(project_dir: str, target_file: str, patch_text: str) -> str | None:
     project_root = Path(project_dir).resolve()
     file_path = project_root / target_file
 
     if not file_path.exists() or not file_path.is_file():
-        return patch_text
+        return None
 
     original_text = file_path.read_text(encoding="utf-8", errors="ignore")
     modified_text = original_text
 
     replacements = extract_simple_replacements_from_patch(patch_text)
-
     if not replacements:
-        return patch_text
+        return None
 
     changed = False
 
@@ -213,28 +303,172 @@ def rebuild_patch_with_context(project_dir: str, target_files: list[str], patch_
             changed = True
 
     if not changed or modified_text == original_text:
-        return patch_text
+        return None
 
-    original_lines = original_text.splitlines(keepends=True)
-    modified_lines = modified_text.splitlines(keepends=True)
-
-    diff_lines = difflib.unified_diff(
-        original_lines,
-        modified_lines,
-        fromfile=f"a/{target_file}",
-        tofile=f"b/{target_file}",
-        n=3,
+    return build_unified_diff(
+        target_file=target_file,
+        original_text=original_text,
+        modified_text=modified_text,
     )
 
-    rebuilt_patch = "".join(diff_lines)
 
-    if not rebuilt_patch.endswith("\n"):
-        rebuilt_patch += "\n"
+def parse_unified_diff_hunks(patch_text: str) -> list[list[str]]:
+    hunks = []
+    current_hunk = None
 
-    return rebuilt_patch
+    for line in patch_text.splitlines():
+        if line.startswith("@@"):
+            if current_hunk:
+                hunks.append(current_hunk)
+            current_hunk = []
+            continue
+
+        if current_hunk is None:
+            continue
+
+        if line.startswith("\\ No newline"):
+            continue
+
+        if line.startswith((" ", "+", "-")):
+            if line.startswith("---") or line.startswith("+++"):
+                continue
+            current_hunk.append(line)
+
+    if current_hunk:
+        hunks.append(current_hunk)
+
+    return hunks
 
 
-def normalize_patch_result(patch_result: dict, project_dir: str) -> dict:
+def find_sequence(lines: list[str], pattern: list[str]) -> int:
+    if not pattern:
+        return -1
+
+    max_start = len(lines) - len(pattern)
+
+    for start in range(max_start + 1):
+        if lines[start:start + len(pattern)] == pattern:
+            return start
+
+    return -1
+
+
+def apply_hunks_to_lines(original_lines: list[str], hunks: list[list[str]]) -> tuple[bool, list[str]]:
+    modified_lines = list(original_lines)
+    changed = False
+
+    for hunk in hunks:
+        before_block = []
+        after_block = []
+
+        for line in hunk:
+            prefix = line[:1]
+            content = line[1:]
+
+            if prefix == " ":
+                before_block.append(content)
+                after_block.append(content)
+            elif prefix == "-":
+                before_block.append(content)
+            elif prefix == "+":
+                after_block.append(content)
+
+        start = find_sequence(modified_lines, before_block)
+
+        if start == -1:
+            return False, original_lines
+
+        end = start + len(before_block)
+        modified_lines = modified_lines[:start] + after_block + modified_lines[end:]
+        changed = True
+
+    return changed, modified_lines
+
+
+def rebuild_patch_by_hunks(project_dir: str, target_file: str, patch_text: str) -> str | None:
+    project_root = Path(project_dir).resolve()
+    file_path = project_root / target_file
+
+    if not file_path.exists() or not file_path.is_file():
+        return None
+
+    original_text = file_path.read_text(encoding="utf-8", errors="ignore")
+    original_lines = original_text.splitlines()
+
+    hunks = parse_unified_diff_hunks(patch_text)
+    if not hunks:
+        return None
+
+    changed, modified_lines = apply_hunks_to_lines(original_lines, hunks)
+
+    if not changed or modified_lines == original_lines:
+        return None
+
+    modified_text = "\n".join(modified_lines) + "\n"
+
+    return build_unified_diff(
+        target_file=target_file,
+        original_text=original_text,
+        modified_text=modified_text,
+    )
+
+
+def rebuild_patch_with_context(
+    project_dir: str,
+    target_files: list[str],
+    patch_text: str,
+    error_text: str,
+    patch_result: dict,
+) -> str:
+    """
+    根据 LLM patch 的修改意图，重新生成 git apply 更容易接受的标准 patch。
+
+    优先级：
+    1. 已知错误模式的确定性重建，例如 LangGraph config 缺失
+    2. hunk 上下文重建
+    3. 简单单行替换重建
+    4. 全部失败则保留原 patch
+    """
+    known_patch = rebuild_langgraph_config_patch(
+        project_dir=project_dir,
+        target_files=target_files,
+        error_text=error_text,
+        patch_result=patch_result,
+    )
+
+    if known_patch:
+        return known_patch
+
+    if not target_files:
+        return patch_text
+
+    if len(target_files) != 1:
+        return patch_text
+
+    target_file = target_files[0]
+
+    rebuilt = rebuild_patch_by_hunks(
+        project_dir=project_dir,
+        target_file=target_file,
+        patch_text=patch_text,
+    )
+
+    if rebuilt:
+        return rebuilt
+
+    rebuilt = rebuild_patch_by_simple_replacements(
+        project_dir=project_dir,
+        target_file=target_file,
+        patch_text=patch_text,
+    )
+
+    if rebuilt:
+        return rebuilt
+
+    return patch_text
+
+
+def normalize_patch_result(patch_result: dict, project_dir: str, error_text: str) -> dict:
     result = dict(patch_result)
 
     target_files = result.get("target_files", [])
@@ -252,6 +486,8 @@ def normalize_patch_result(patch_result: dict, project_dir: str) -> dict:
             project_dir=project_dir,
             target_files=normalized_target_files,
             patch_text=raw_patch,
+            error_text=error_text,
+            patch_result=result,
         )
 
     result["patch"] = normalize_patch_paths(raw_patch, project_dir)
@@ -342,7 +578,11 @@ def run_patch_agent(
             "related_files": related_files,
         }
 
-    patch_result = normalize_patch_result(patch_result, project_dir=project_dir)
+    patch_result = normalize_patch_result(
+        patch_result=patch_result,
+        project_dir=project_dir,
+        error_text=error_text,
+    )
 
     ok, error = validate_patch_result(patch_result)
     if not ok:

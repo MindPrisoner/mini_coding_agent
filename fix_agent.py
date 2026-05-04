@@ -3,15 +3,15 @@ import json
 import subprocess
 from pathlib import Path
 
-from patch_agent import run_patch_agent, load_error_text
+from edit_agent import run_edit_agent, load_error_text
 from patch_review_agent import run_patch_review
 from agent_tools.shell_tools import run_command
 
 
 def build_user_next_steps(result: dict) -> dict:
-    patch_result = result.get("patch_result", {})
-    review_result = result.get("review_result", {})
-    manual_commands = result.get("manual_commands", {})
+    patch_result = result.get("patch_result") or {}
+    review_result = result.get("review_result") or {}
+    manual_commands = result.get("manual_commands") or {}
 
     need_patch = patch_result.get("need_patch", False)
     safe_to_apply = review_result.get("safe_to_apply", False)
@@ -27,26 +27,17 @@ def build_user_next_steps(result: dict) -> dict:
         return {
             "status": "patch_not_safe",
             "message": "Patch Review 判断该补丁暂不适合直接应用，请先人工检查。",
-            "commands": manual_commands or {}
+            "commands": manual_commands
         }
 
     return {
         "status": "ready_to_apply",
         "message": "补丁已生成并通过审查。你可以手动应用 patch，或使用 --apply --yes 自动应用。",
-        "commands": manual_commands or {}
+        "commands": manual_commands
     }
 
 
 def apply_patch_file(project_dir: str, patch_file: str, timeout: int = 30) -> dict:
-    """
-    使用 git apply 应用 patch。
-
-    注意：
-    这里不通过 shell=True 执行，而是用参数列表执行：
-    ["git", "apply", patch_file]
-
-    这样可以避免 shell 注入风险。
-    """
     project_root = Path(project_dir).resolve()
     patch_path = Path(patch_file).resolve()
 
@@ -92,12 +83,6 @@ def apply_patch_file(project_dir: str, patch_file: str, timeout: int = 30) -> di
 
 
 def revert_patch_file(project_dir: str, patch_file: str, timeout: int = 30) -> dict:
-    """
-    使用 git apply -R 回滚 patch。
-
-    这一版只是提供能力，不在主流程里自动调用。
-    真正需要回滚时，你可以根据最终输出里的 revert 命令手动执行。
-    """
     project_root = Path(project_dir).resolve()
     patch_path = Path(patch_file).resolve()
 
@@ -143,15 +128,8 @@ def revert_patch_file(project_dir: str, patch_file: str, timeout: int = 30) -> d
 
 
 def should_allow_auto_apply(review_result: dict, apply: bool, yes: bool) -> tuple[bool, str]:
-    """
-    判断是否允许自动应用 patch。
+    review_result = review_result or {}
 
-    必须同时满足：
-    1. 用户传入 --apply
-    2. 用户传入 --yes
-    3. review_result.safe_to_apply 为 true
-    4. review_result.risk_level 为 low
-    """
     if not apply:
         return False, "未启用 --apply，默认不自动应用 patch。"
 
@@ -174,16 +152,6 @@ def run_optional_apply_and_verify(
     apply: bool,
     yes: bool,
 ) -> dict:
-    """
-    可选执行：
-    1. 自动应用 patch
-    2. 自动运行验证命令
-
-    如果未满足安全条件，则只返回 skipped。
-    """
-    apply_result = None
-    verify_result = None
-
     if not apply or not yes:
         return {
             "auto_apply_enabled": False,
@@ -191,7 +159,12 @@ def run_optional_apply_and_verify(
             "verify_result": None,
         }
 
-    apply_result = apply_patch_file(project_dir=project_dir, patch_file=patch_file)
+    apply_result = apply_patch_file(
+        project_dir=project_dir,
+        patch_file=patch_file,
+    )
+
+    verify_result = None
 
     if apply_result.get("ok") and verify_command:
         verify_result = run_command(
@@ -215,9 +188,9 @@ def run_fix_agent(
     apply: bool = False,
     yes: bool = False,
 ) -> dict:
-    print("\n========== Step 1: 生成 Patch ==========")
+    print("\n========== Step 1: 生成结构化编辑 Patch ==========")
 
-    patch_agent_result = run_patch_agent(
+    edit_agent_result = run_edit_agent(
         project_dir=project_dir,
         error_text=error_text,
         max_debug_steps=max_debug_steps,
@@ -225,44 +198,46 @@ def run_fix_agent(
         patch_dir=patch_dir,
     )
 
-    if not patch_agent_result.get("ok"):
+    if not edit_agent_result.get("ok"):
         return {
             "ok": False,
-            "stage": "patch_generation",
-            "error": patch_agent_result.get("error", "Patch 生成失败"),
-            "patch_agent_result": patch_agent_result,
+            "stage": "structured_edit_generation",
+            "error": edit_agent_result.get("error", "结构化编辑生成失败"),
+            "edit_agent_result": edit_agent_result,
         }
 
-    patch_result = patch_agent_result.get("patch_result", {})
-    saved_patch_path = patch_agent_result.get("saved_patch_path")
+    patch_result = edit_agent_result.get("patch_result") or {}
+    saved_patch_path = edit_agent_result.get("saved_patch_path")
 
     if not patch_result.get("need_patch"):
-        return {
+        combined_result = {
             "ok": True,
             "stage": "no_patch_needed",
-            "patch_agent_result": patch_agent_result,
+            "project_dir": project_dir,
+            "saved_patch_path": saved_patch_path,
+            "debug_result": edit_agent_result.get("debug_result"),
+            "edit_result": edit_agent_result.get("edit_result"),
             "patch_result": patch_result,
             "review_result": None,
-            "saved_patch_path": saved_patch_path,
-            "manual_commands": patch_agent_result.get("manual_commands"),
-            "next_steps": build_user_next_steps({
-                "patch_result": patch_result,
-                "review_result": {},
-                "manual_commands": patch_agent_result.get("manual_commands"),
-            }),
+            "apply_check_result": None,
+            "manual_commands": edit_agent_result.get("manual_commands"),
             "auto_apply": {
                 "auto_apply_enabled": False,
+                "reason": "不需要 patch，因此不会自动应用。",
                 "apply_result": None,
                 "verify_result": None,
             },
         }
+
+        combined_result["next_steps"] = build_user_next_steps(combined_result)
+        return combined_result
 
     if not saved_patch_path:
         return {
             "ok": False,
             "stage": "patch_save",
             "error": "需要 patch，但没有生成 saved_patch_path",
-            "patch_agent_result": patch_agent_result,
+            "edit_agent_result": edit_agent_result,
         }
 
     print("\n========== Step 2: 审查 Patch ==========")
@@ -273,7 +248,7 @@ def run_fix_agent(
         error_text=error_text,
     )
 
-    review_result = review_agent_result.get("review_result", {})
+    review_result = review_agent_result.get("review_result") or {}
 
     allow_apply, apply_reason = should_allow_auto_apply(
         review_result=review_result,
@@ -290,6 +265,7 @@ def run_fix_agent(
 
     if allow_apply:
         print("\n========== Step 3: 自动应用并验证 ==========")
+
         auto_apply_result = run_optional_apply_and_verify(
             project_dir=project_dir,
             patch_file=saved_patch_path,
@@ -304,11 +280,12 @@ def run_fix_agent(
         "stage": "completed",
         "project_dir": project_dir,
         "saved_patch_path": saved_patch_path,
-        "debug_result": patch_agent_result.get("debug_result"),
+        "debug_result": edit_agent_result.get("debug_result"),
+        "edit_result": edit_agent_result.get("edit_result"),
         "patch_result": patch_result,
         "review_result": review_result,
         "apply_check_result": review_agent_result.get("apply_check_result"),
-        "manual_commands": patch_agent_result.get("manual_commands"),
+        "manual_commands": edit_agent_result.get("manual_commands"),
         "auto_apply": auto_apply_result,
     }
 
