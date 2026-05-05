@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: mini-coding-agent
+Version: 0.1.0
+Summary: A local coding agent for debug, structured edit, patch review, human-in-the-loop apply and verify.
+Requires-Python: >=3.11
+Requires-Dist: openai
+Requires-Dist: python-dotenv

@@ -1,0 +1,2 @@
+[console_scripts]
+mini-fix = mini_fix:main

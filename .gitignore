@@ -1,27 +1,12 @@
+.env
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-
-.venv/
-env/
-venv/
-.env
-
-runs/
-logs/
-checkpoints/
-data/
-
-*.pt
-*.pth
-*.ckpt
-
-.idea/
-.vscode/
-
 .DS_Store
 
 patches/*.patch
+!patches/.gitkeep
+
+reports/*.json
+!reports/.gitkeep
 
 tmp_regression/

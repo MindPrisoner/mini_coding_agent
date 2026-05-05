@@ -1,0 +1,8 @@
+{
+  "max_debug_steps": 8,
+  "patch_dir": "patches",
+  "report_dir": "reports",
+  "auto_apply_requires_yes": true,
+  "default_apply": false,
+  "default_yes": false
+}

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mini-coding-agent"
+version = "0.1.0"
+description = "A local coding agent for debug, structured edit, patch review, human-in-the-loop apply and verify."
+requires-python = ">=3.11"
+dependencies = [
+    "openai",
+    "python-dotenv",
+]
+
+[project.scripts]
+mini-fix = "mini_fix:main"
+
+[tool.setuptools]
+py-modules = [
+    "agent_cli",
+    "coding_agent",
+    "config",
+    "debug_agent",
+    "debug_prompts",
+    "edit_agent",
+    "edit_prompts",
+    "fix_agent",
+    "llm_client",
+    "mini_fix",
+    "patch_agent",
+    "patch_prompts",
+    "patch_review_agent",
+    "patch_review_prompts",
+    "prompts",
+]
+
+[tool.setuptools.packages.find]
+include = ["agent_tools*"]

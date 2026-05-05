@@ -1,0 +1,16 @@
+agent_cli
+agent_tools
+coding_agent
+config
+debug_agent
+debug_prompts
+edit_agent
+edit_prompts
+fix_agent
+llm_client
+mini_fix
+patch_agent
+patch_prompts
+patch_review_agent
+patch_review_prompts
+prompts
